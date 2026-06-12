@@ -171,6 +171,7 @@ class WanTI2V:
                  guide_scale=5.0,
                  n_prompt="",
                  seed=-1,
+                 latents=None,
                  offload_model=True):
         r"""
         Generates video frames from text prompt using diffusion process.
@@ -222,6 +223,7 @@ class WanTI2V:
                 guide_scale=guide_scale,
                 n_prompt=n_prompt,
                 seed=seed,
+                latents=latents,
                 offload_model=offload_model)
         # t2v
         return self.t2v(
@@ -234,6 +236,7 @@ class WanTI2V:
             guide_scale=guide_scale,
             n_prompt=n_prompt,
             seed=seed,
+            latents=latents,
             offload_model=offload_model)
 
     def t2v(self,
@@ -246,6 +249,7 @@ class WanTI2V:
             guide_scale=5.0,
             n_prompt="",
             seed=-1,
+            latents=None,
             offload_model=True):
         r"""
         Generates video frames from text prompt using diffusion process.
@@ -354,7 +358,7 @@ class WanTI2V:
                 raise NotImplementedError("Unsupported solver.")
 
             # sample videos
-            latents = noise
+            latents = noise if latents is None else latents
             mask1, mask2 = masks_like(noise, zero=False)
 
             arg_c = {'context': context, 'seq_len': seq_len}
@@ -421,6 +425,7 @@ class WanTI2V:
             guide_scale=5.0,
             n_prompt="",
             seed=-1,
+            latents=None,
             offload_model=True):
         r"""
         Generates video frames from input image and text prompt using diffusion process.
@@ -546,7 +551,8 @@ class WanTI2V:
                 raise NotImplementedError("Unsupported solver.")
 
             # sample videos
-            latent = noise
+            latent = noise if latents is None else latents[0]
+
             mask1, mask2 = masks_like([noise], zero=True)
             latent = (1. - mask2[0]) * z[0] + mask2[0] * latent
 

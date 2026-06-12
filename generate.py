@@ -18,8 +18,11 @@ import wan
 from wan.configs import MAX_AREA_CONFIGS, SIZE_CONFIGS, SUPPORTED_SIZES, WAN_CONFIGS
 from wan.distributed.util import init_distributed_group
 from wan.utils.prompt_extend import DashScopePromptExpander, QwenPromptExpander
-from wan.utils.utils import merge_video_audio, save_video, str2bool
+from wan.utils.utils import save_video, str2bool
 
+# Phi-noise imports
+from phi_noise_utils import freq_mix_spatial, freq_mix_temporal
+from video_processing_utils import encode_video
 
 EXAMPLE_PROMPT = {
     "t2v-A14B": {
@@ -294,6 +297,39 @@ def _parse_args():
         default=80,
         help="Number of frames per clip, 48 or 80 or others (must be multiple of 4) for 14B s2v"
     )
+
+    ######################
+    # Phi-Noise args #
+    ######################
+
+    parser.add_argument(
+        "--pn_task",
+        type=str,
+        default='i2v_mt',
+        choices=['i2v_mt', 't2v_mt', 'cnd'],
+        help="The specific task for applying Phi-Noise. `i2v_mt` means applying Phi-Noise on I2V model for motion transfer, `t2v_mt` means applying Phi-Noise on T2V model for motion transfer, and `cud` means applying cut-n-drag"
+    )
+
+
+    parser.add_argument(
+        "--pn_ref_path",
+        type=str,
+        default=None,
+        help="gudance video for frequency mix, should be preprocessed by `preprocess_guidance_video.py` to align the size and frame number with the generation target. Only used for ti2v task."
+    )
+    parser.add_argument(
+        "--pn_alpha",
+        type=str,
+        default=None,
+        help="how much of low-frequency to mix"
+    )
+    parser.add_argument(
+        "--pn_gamma",
+        type=str,
+        default=None,
+        help="Division factor of low-frequency before mixing (SPATIAL)"
+    )
+
     args = parser.parse_args()
     _validate_args(args)
 
@@ -318,6 +354,22 @@ def generate(args):
     local_rank = int(os.getenv("LOCAL_RANK", 0))
     device = local_rank
     _init_logging(rank)
+
+    if '#' in args.pn_alpha:
+        pn_alpha = [float(x) for x in args.pn_alpha.split('#')]
+    else:
+        args.pn_alpha = int(args.pn_alpha)
+        pn_alpha = [args.pn_alpha]
+    if '#' in args.pn_gamma:
+        pn_gamma = [float(x) for x in args.pn_gamma.split('#')]
+    else:
+        args.pn_gamma = float(args.pn_gamma)
+        pn_gamma = [args.pn_gamma]
+
+    if isinstance(args.pn_gamma, list):
+        args.pn_alpha = [args.pn_alpha] * len(args.pn_gamma)
+    elif isinstance(args.pn_alpha, list):
+        args.pn_gamma = [args.pn_gamma] * len(args.pn_alpha)
 
     if args.offload_model is None:
         args.offload_model = False if world_size > 1 else True
@@ -373,8 +425,11 @@ def generate(args):
     logging.info(f"Input prompt: {args.prompt}")
     img = None
     if args.image is not None:
-        img = Image.open(args.image).convert("RGB")
+        img = Image.open(args.image).convert("RGB").resize(SIZE_CONFIGS[args.size])
         logging.info(f"Input image: {args.image}")
+    
+    if args.pn_ref_path is not None:
+        logging.info(f"Phi-Noise reference video: {args.pn_ref_path}")
 
     # prompt extend
     if args.use_prompt_extend:
@@ -414,17 +469,52 @@ def generate(args):
             convert_model_dtype=args.convert_model_dtype,
         )
 
-        logging.info(f"Generating video ...")
-        video = wan_t2v.generate(
-            args.prompt,
-            size=SIZE_CONFIGS[args.size],
-            frame_num=args.frame_num,
-            shift=args.sample_shift,
-            sample_solver=args.sample_solver,
-            sampling_steps=args.sample_steps,
-            guide_scale=args.sample_guide_scale,
-            seed=args.base_seed,
-            offload_model=args.offload_model)
+        for i, (_gamma, _alpha) in enumerate(zip(pn_gamma, pn_alpha)):
+            seed_generator = torch.Generator(device=device).manual_seed(args.base_seed + i)
+            logging.info(f'Current Seed: {args.base_seed + i}')
+
+            ######### Phi-Noise generation #########
+            if args.pn_ref_path is not None:
+                latents_ref, _ = encode_video(args.pn_ref_path, target_size=(832, 464), vae_enc=wan_t2v.vae)                
+                noise = [torch.randn(*latents_ref[0].shape, dtype=torch.float32, device=wan_t2v.device, generator=seed_generator)]                
+                
+                if args.pn_task in ['i2v_mt', 'cnd']:
+                    latents = freq_mix_temporal(noise, latents_ref,
+                                                gamma=_gamma,
+                                                alpha=_alpha,
+                                                exclude_dc=False,
+                                                motion_mask=motion_mask if args.use_motion_mask else None)
+                elif args.pn_task == 't2v_mt':
+                    latents = [freq_mix_spatial(noise[0].type(torch.float),
+                                                        latents_ref[0].type(torch.float),
+                                                        alpha=_alpha,
+                                                        gamma=_gamma,
+                                                        dims=("h", "w")).type(torch.float)]
+
+                logging.info(f"Phi-Noise generation parameters:\n\tgamma={_gamma}\n\talpha={_alpha}")
+            else:
+                latents = None
+            #################################
+
+            logging.info(f"Generating video ...")
+            video = wan_t2v.generate(
+                args.prompt,
+                n_prompt='camera movement, panning, zooming, tracking, dolly, shaky cam, camera rotation, tilting, crane shot, background drift, motion blur',
+                size=SIZE_CONFIGS[args.size],
+                frame_num=args.frame_num,
+                shift=args.sample_shift,
+                sample_solver=args.sample_solver,
+                sampling_steps=args.sample_steps,
+                guide_scale=args.sample_guide_scale,
+                seed=args.base_seed,
+                latents=latents,
+                offload_model=args.offload_model)
+            
+            if rank == 0:
+                save_generated_video(video, sample_fps=cfg.sample_fps, prompt=args.prompt, args=args)
+            del video
+            torch.cuda.synchronize()
+
     elif "ti2v" in args.task:
         logging.info("Creating WanTI2V pipeline.")
         wan_ti2v = wan.WanTI2V(
@@ -439,19 +529,53 @@ def generate(args):
             convert_model_dtype=args.convert_model_dtype,
         )
 
-        logging.info(f"Generating video ...")
-        video = wan_ti2v.generate(
-            args.prompt,
-            img=img,
-            size=SIZE_CONFIGS[args.size],
-            max_area=MAX_AREA_CONFIGS[args.size],
-            frame_num=args.frame_num,
-            shift=args.sample_shift,
-            sample_solver=args.sample_solver,
-            sampling_steps=args.sample_steps,
-            guide_scale=args.sample_guide_scale,
-            seed=args.base_seed,
-            offload_model=args.offload_model)
+        for i, (_alpha, _gamma) in enumerate(zip(pn_alpha, pn_gamma)):
+            seed_generator = torch.Generator(device=device).manual_seed(args.base_seed + i)
+
+            ######### Phi-Noise generation #########
+            if args.pn_ref_path is not None:
+                latents_ref, _ = encode_video(args.pn_ref_path, target_size=(1280, 704), vae_enc=wan_ti2v.vae)                
+                noise = [torch.randn(*latents_ref[0].shape, dtype=torch.float32, device=wan_ti2v.device, generator=seed_generator)]
+                
+                if args.pn_task in ['i2v_mt', 'cnd']:
+                    latents = mix_phase_magnitude(noise, latents_ref,
+                                                gamma=_gamma,
+                                                alpha=_alpha,
+                                                exclude_dc=False,
+                                                motion_mask=motion_mask if args.use_motion_mask else None)
+                elif args.pn_task == 't2v_mt':
+                    latents = [fft_lowfreq_swap_phase_nd2_norm(noise[0].type(torch.float),
+                                                        latents_ref[0].type(torch.float),
+                                                        alpha=_alpha,
+                                                        gamma=_gamma,
+                                                        dims=("h", "w")).type(torch.float)]
+
+                logging.info(f"Phi-Noise generation parameters:\n\tgamma={_gamma}\n\talpha={_alpha}")
+            else:
+                latents = None
+            #################################
+
+
+            video = wan_ti2v.generate(
+                args.prompt,
+                img=img,
+                n_prompt='camera movement, panning, zooming, tracking, dolly, shaky cam, camera rotation, tilting, crane shot, background drift, motion blur',
+                size=SIZE_CONFIGS[args.size],
+                max_area=MAX_AREA_CONFIGS[args.size],
+                frame_num=args.frame_num,
+                shift=args.sample_shift,
+                sample_solver=args.sample_solver,
+                sampling_steps=args.sample_steps,
+                guide_scale=args.sample_guide_scale,
+                seed=args.base_seed,
+                latents=latents,
+                offload_model=args.offload_model)
+            
+            if rank == 0:
+                save_generated_video(video, sample_fps=cfg.sample_fps, prompt=args.prompt, args=args)
+            del video
+            torch.cuda.synchronize()
+
     elif "animate" in args.task:
         logging.info("Creating Wan-Animate pipeline.")
         wan_animate = wan.WanAnimate(
@@ -526,41 +650,48 @@ def generate(args):
             t5_cpu=args.t5_cpu,
             convert_model_dtype=args.convert_model_dtype,
         )
-        logging.info("Generating video ...")
-        video = wan_i2v.generate(
-            args.prompt,
-            img,
-            max_area=MAX_AREA_CONFIGS[args.size],
-            frame_num=args.frame_num,
-            shift=args.sample_shift,
-            sample_solver=args.sample_solver,
-            sampling_steps=args.sample_steps,
-            guide_scale=args.sample_guide_scale,
-            seed=args.base_seed,
-            offload_model=args.offload_model)
+        for i, _alpha, _gamma in enumerate(zip(args.pn_alpha, args.pn_gamma)):
+            seed_generator = torch.Generator(device=wan_i2v.device).manual_seed(args.base_seed + i)
 
-    if rank == 0:
-        if args.save_file is None:
-            formatted_time = datetime.now().strftime("%Y%m%d_%H%M%S")
-            formatted_prompt = args.prompt.replace(" ", "_").replace("/",
-                                                                     "_")[:50]
-            suffix = '.mp4'
-            args.save_file = f"{args.task}_{args.size.replace('*','x') if sys.platform=='win32' else args.size}_{args.ulysses_size}_{formatted_prompt}_{formatted_time}" + suffix
-
-        logging.info(f"Saving generated video to {args.save_file}")
-        save_video(
-            tensor=video[None],
-            save_file=args.save_file,
-            fps=cfg.sample_fps,
-            nrow=1,
-            normalize=True,
-            value_range=(-1, 1))
-        if "s2v" in args.task:
-            if args.enable_tts is False:
-                merge_video_audio(video_path=args.save_file, audio_path=args.audio)
+            ######### Phi-Noise generation #########
+            if args.pn_ref_path is not None:
+                latents_ref, motion_mask = encode_video(args.pn_ref_path, target_size=(832, 464), vae_enc=wan_i2v.vae)                
+                noise = [torch.randn(*latents_ref[0].shape, dtype=torch.float32, device=wan_i2v.device, generator=seed_generator)]                
+                
+                if args.pn_task in ['i2v_mt', 'cnd']:
+                    latents = mix_phase_magnitude(noise, latents_ref,
+                                                gamma=_gamma,
+                                                alpha=_alpha,
+                                                exclude_dc=False,
+                                                motion_mask=motion_mask if args.use_motion_mask else None)
+                elif args.pn_task == 't2v_mt':
+                    latents = [fft_lowfreq_swap_phase_nd2_norm(noise[0].type(torch.float),
+                                                        latents_ref[0].type(torch.float),
+                                                        level=_alpha,
+                                                        gamma=_gamma,
+                                                        dims=("h", "w")).type(torch.float)]
+                logging.info(f"Phi-Noise generation parameters:\n\tgamma={_gamma}\n\talpha={_alpha}")
             else:
-                merge_video_audio(video_path=args.save_file, audio_path="tts.wav")
-    del video
+                latents = None
+            #################################
+            
+            logging.info("Generating video ...")
+            video = wan_i2v.generate(
+                args.prompt,
+                img,
+                max_area=MAX_AREA_CONFIGS[args.size],
+                frame_num=args.frame_num,
+                shift=args.sample_shift,
+                sample_solver=args.sample_solver,
+                sampling_steps=args.sample_steps,
+                guide_scale=args.sample_guide_scale,
+                seed=args.base_seed,
+                latents=latents,
+                offload_model=args.offload_model)
+
+            if rank == 0:
+                save_generated_video(video, sample_fps=cfg.sample_fps, args=args, prompt=args.prompt)
+            del video
 
     torch.cuda.synchronize()
     if dist.is_initialized():
@@ -568,6 +699,33 @@ def generate(args):
         dist.destroy_process_group()
 
     logging.info("Finished.")
+
+
+def save_generated_video(video, sample_fps, prompt, args):
+        if args.save_file is None:
+            formatted_time = datetime.now().strftime("%Y%m%d_%H%M%S")
+            formatted_prompt = prompt.replace(" ", "_").replace("/", "_")[:50]
+            suffix = '.mp4'
+            if not os.path.exists('OUTPUTS'):
+                os.makedirs('OUTPUTS', exist_ok=True)
+            save_file = f"OUTPUTS/{args.task}_{args.size.replace('*','x') if sys.platform=='win32' else args.size}_{args.ulysses_size}_{formatted_prompt}_{formatted_time}" + suffix
+            if os.path.exists(save_file):
+                save_file = args.save_file.replace(suffix, f"_{random.randint(0, 9999)}{suffix}")
+        logging.info(f"Saving generated video to {save_file}")
+        save_video(
+            tensor=video[None],
+            save_file=save_file,
+            fps=sample_fps,
+            nrow=1,
+            normalize=True,
+            value_range=(-1, 1))
+        
+        # irrelevant
+        # if "s2v" in args.task:
+        #     if args.enable_tts is False:
+        #         merge_video_audio(video_path=args.save_file, audio_path=args.audio)
+        #     else:
+        #         merge_video_audio(video_path=args.save_file, audio_path="tts.wav")
 
 
 if __name__ == "__main__":
