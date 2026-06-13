@@ -358,18 +358,16 @@ def generate(args):
     if '#' in args.pn_alpha:
         pn_alpha = [float(x) for x in args.pn_alpha.split('#')]
     else:
-        args.pn_alpha = int(args.pn_alpha)
-        pn_alpha = [args.pn_alpha]
+        pn_alpha = float(args.pn_alpha)
     if '#' in args.pn_gamma:
         pn_gamma = [float(x) for x in args.pn_gamma.split('#')]
     else:
-        args.pn_gamma = float(args.pn_gamma)
-        pn_gamma = [args.pn_gamma]
+        pn_gamma = float(args.pn_gamma)
 
-    if isinstance(args.pn_gamma, list):
-        args.pn_alpha = [args.pn_alpha] * len(args.pn_gamma)
-    elif isinstance(args.pn_alpha, list):
-        args.pn_gamma = [args.pn_gamma] * len(args.pn_alpha)
+    if isinstance(pn_gamma, list):
+        pn_alpha = [pn_alpha] * len(pn_gamma)
+    elif isinstance(pn_alpha, list):
+        pn_gamma = [pn_gamma] * len(pn_alpha)
 
     if args.offload_model is None:
         args.offload_model = False if world_size > 1 else True
