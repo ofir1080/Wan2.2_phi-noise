@@ -214,6 +214,7 @@ class WanI2V:
                  guide_scale=5.0,
                  n_prompt="",
                  seed=-1,
+                 latents=None,
                  offload_model=True):
         r"""
         Generates video frames from input image and text prompt using diffusion process.
@@ -362,7 +363,7 @@ class WanI2V:
                 raise NotImplementedError("Unsupported solver.")
 
             # sample videos
-            latent = noise
+            latent = noise if latents is None else latents[0]
 
             arg_c = {
                 'context': [context[0]],

@@ -480,8 +480,7 @@ def generate(args):
                     latents = freq_mix_temporal(noise, latents_ref,
                                                 gamma=_gamma,
                                                 alpha=_alpha,
-                                                exclude_dc=False,
-                                                motion_mask=motion_mask if args.use_motion_mask else None)
+                                                exclude_dc=False)
                 elif args.pn_task == 't2v_mt':
                     latents = [freq_mix_spatial(noise[0].type(torch.float),
                                                         latents_ref[0].type(torch.float),
@@ -536,13 +535,12 @@ def generate(args):
                 noise = [torch.randn(*latents_ref[0].shape, dtype=torch.float32, device=wan_ti2v.device, generator=seed_generator)]
                 
                 if args.pn_task in ['i2v_mt', 'cnd']:
-                    latents = mix_phase_magnitude(noise, latents_ref,
+                    latents = freq_mix_temporal(noise, latents_ref,
                                                 gamma=_gamma,
                                                 alpha=_alpha,
-                                                exclude_dc=False,
-                                                motion_mask=motion_mask if args.use_motion_mask else None)
+                                                exclude_dc=False)
                 elif args.pn_task == 't2v_mt':
-                    latents = [fft_lowfreq_swap_phase_nd2_norm(noise[0].type(torch.float),
+                    latents = [freq_mix_spatial(noise[0].type(torch.float),
                                                         latents_ref[0].type(torch.float),
                                                         alpha=_alpha,
                                                         gamma=_gamma,
@@ -648,24 +646,23 @@ def generate(args):
             t5_cpu=args.t5_cpu,
             convert_model_dtype=args.convert_model_dtype,
         )
-        for i, _alpha, _gamma in enumerate(zip(args.pn_alpha, args.pn_gamma)):
+        for i, (_alpha, _gamma) in enumerate(zip(pn_alpha, pn_gamma)):
             seed_generator = torch.Generator(device=wan_i2v.device).manual_seed(args.base_seed + i)
 
             ######### Phi-Noise generation #########
             if args.pn_ref_path is not None:
-                latents_ref, motion_mask = encode_video(args.pn_ref_path, target_size=(832, 464), vae_enc=wan_i2v.vae)                
+                latents_ref, _ = encode_video(args.pn_ref_path, target_size=(832, 464), vae_enc=wan_i2v.vae)                
                 noise = [torch.randn(*latents_ref[0].shape, dtype=torch.float32, device=wan_i2v.device, generator=seed_generator)]                
                 
                 if args.pn_task in ['i2v_mt', 'cnd']:
-                    latents = mix_phase_magnitude(noise, latents_ref,
+                    latents = freq_mix_temporal(noise, latents_ref,
                                                 gamma=_gamma,
                                                 alpha=_alpha,
-                                                exclude_dc=False,
-                                                motion_mask=motion_mask if args.use_motion_mask else None)
+                                                exclude_dc=False)
                 elif args.pn_task == 't2v_mt':
-                    latents = [fft_lowfreq_swap_phase_nd2_norm(noise[0].type(torch.float),
+                    latents = [freq_mix_spatial(noise[0].type(torch.float),
                                                         latents_ref[0].type(torch.float),
-                                                        level=_alpha,
+                                                        alpha=_alpha,
                                                         gamma=_gamma,
                                                         dims=("h", "w")).type(torch.float)]
                 logging.info(f"Phi-Noise generation parameters:\n\tgamma={_gamma}\n\talpha={_alpha}")
